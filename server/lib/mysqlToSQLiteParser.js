@@ -1,126 +1,157 @@
+// Helper function to format SQL with consistent indentation
+const formatSQL = (sql) => {
+    // For simple queries (no newlines in original and no complex parts), keep them on one line
+    if (!sql.includes('\n') && !sql.toLowerCase().includes('case when') && !sql.toLowerCase().includes('group by')) {
+        return sql.replace(/\s+/g, ' ').trim();
+    }
+
+    const lines = sql.split('\n').map(line => line.trim()).filter(line => line);
+    const result = [];
+    let indentLevel = 0;
+
+    for (let line of lines) {
+        // Determine indentation
+        if (line.toUpperCase().startsWith('FROM') ||
+            line.toUpperCase().startsWith('WHERE') ||
+            line.toUpperCase().startsWith('GROUP BY') ||
+            line.toUpperCase().startsWith('HAVING') ||
+            line.toUpperCase().startsWith('ORDER BY') ||
+            line.toUpperCase().startsWith('LIMIT')) {
+            indentLevel = 0;
+        }
+
+        // Add line with proper indentation
+        const indent = '    '.repeat(Math.max(0, indentLevel));
+        result.push(indent + line);
+
+        // Adjust indent level for next line
+        if (line.toUpperCase().startsWith('SELECT')) {
+            indentLevel = 1;
+        }
+    }
+
+    return result.join('\n');
+};
+
+// Helper function to format CREATE TABLE statements
+const formatCreateTable = (sql) => {
+    const lines = sql.split('\n').map(line => line.trim()).filter(line => line);
+    const result = [];
+    let inColumns = false;
+
+    for (let line of lines) {
+        if (line.startsWith('CREATE TABLE')) {
+            const tableName = line.match(/CREATE TABLE\s+(\w+)/)[1];
+            result.push(`CREATE TABLE ${tableName} (`);
+            inColumns = true;
+        } else if (line.endsWith(');') || line === ');' || line === ')') {
+            inColumns = false;
+            result.push('    );');
+        } else if (inColumns) {
+            // Remove trailing commas for last column
+            const isLastColumn = !lines.slice(lines.indexOf(line) + 1).some(l => !l.startsWith(')'));
+            const column = line.replace(/,\s*$/, '') + (isLastColumn ? '' : ',');
+            result.push('    ' + column);
+        } else {
+            result.push(line);
+        }
+    }
+
+    return result.join('\n');
+};
+
+// Helper function to handle GROUP_CONCAT
+const handleGroupConcat = (sql) => {
+    // Handle GROUP_CONCAT with DISTINCT
+    sql = sql.replace(/GROUP_CONCAT\((DISTINCT\s+)?([^)]+)\)/gi,
+        (match, distinct, args) => {
+            distinct = distinct || '';
+            return `GROUP_CONCAT(${distinct}${args})`;
+        });
+
+    // Handle dot notation in GROUP_CONCAT
+    sql = sql.replace(/GROUP_CONCAT\(([^)]+\.[^)]+)\)/gi, 'GROUP_CONCAT($1)');
+
+    return sql;
+};
+
+// MySQL to SQLite function mappings
+const functionMappings = [
+    // String Functions
+    { regex: /CONCAT\((.*?)\)/g, replacement: (match, args) => args.split(',').join(' || ') },
+    { regex: /SUBSTRING\((.*?)\)/g, replacement: 'substr($1)' },
+    { regex: /\b(LENGTH|UPPER|LOWER|TRIM|LTRIM|RTRIM|REPLACE)\(/g, replacement: '$1(' },
+
+    // Date/Time Functions
+    { regex: /DATE_ADD\((.*?),\s*INTERVAL\s*(\d+)\s*DAY\)/g, replacement: 'DATETIME($1, \'+$2 DAY\')' },
+    { regex: /DATE_SUB\((.*?),\s*INTERVAL\s*(\d+)\s*DAY\)/g, replacement: 'DATETIME($1, \'-$2 DAY\')' },
+    { regex: /DATEDIFF\((.*?),(.*?)\)/g, replacement: 'CAST((JULIANDAY($1) - JULIANDAY($2)) AS INTEGER)' },
+    { regex: /YEAR\((.*?)\)/g, replacement: 'CAST(strftime(\'%Y\', $1) AS INTEGER)' },
+    { regex: /MONTH\((.*?)\)/g, replacement: 'CAST(strftime(\'%m\', $1) AS INTEGER)' },
+    { regex: /DAY\((.*?)\)/g, replacement: 'CAST(strftime(\'%d\', $1) AS INTEGER)' },
+    { regex: /NOW\(\)/g, replacement: 'DATETIME(\'now\')' },
+
+    // Math Functions
+    { regex: /CEIL\((.*?)\)/g, replacement: 'CAST(ROUND($1 + 0.5) AS INTEGER)' },
+    { regex: /FLOOR\((.*?)\)/g, replacement: 'CAST($1 AS INTEGER)' },
+    { regex: /\b(POW|ABS|SQRT)\(/g, replacement: '$1(' },
+    { regex: /MOD\((.*?),(.*?)\)/g, replacement: '($1 % $2)' },
+    { regex: /\bRAND\(\)/g, replacement: '(ABS(RANDOM()) % 1000000 + 1) / 1000000.0' },
+
+    // Conditional Functions
+    { regex: /IFNULL\((.*?),(.*?)\)/g, replacement: 'COALESCE($1, $2)' },
+    { regex: /IF\((.*?),(.*?),(.*?)\)/g, replacement: 'CASE WHEN $1 THEN $2 ELSE $3 END' },
+    { regex: /NULLIF\((.*?),(.*?)\)/g, replacement: 'CASE WHEN $1 = $2 THEN NULL ELSE $1 END' },
+
+    // Type Conversions
+    { regex: /\b(?:TINY|SMALL|MEDIUM|BIG)?INT\(\d+\)/g, replacement: 'INTEGER' },
+    { regex: /\b(?:VAR)?CHAR\(\d+\)|TEXT\(\d+\)/g, replacement: 'TEXT' },
+    { regex: /\b(?:DECIMAL|FLOAT|DOUBLE)\(\d+,\d+\)/g, replacement: 'REAL' },
+    { regex: /\bTIMESTAMP\b/g, replacement: 'DATETIME' },
+    { regex: /\bBINARY\b/g, replacement: 'BLOB' },
+
+    // Join Types
+    { regex: /\b(?:LEFT|RIGHT|FULL)\s+(?:OUTER\s+)?JOIN\b/g, replacement: 'LEFT JOIN' },
+    { regex: /\bINNER\s+JOIN\b|\bJOIN\b/g, replacement: 'INNER JOIN' },
+
+    // Auto-increment and Primary Key
+    { regex: /AUTO_?INCREMENT(?:\s+PRIMARY\s+KEY|)/gi, replacement: 'PRIMARY KEY AUTOINCREMENT' },
+    { regex: /PRIMARY\s+KEY\s+AUTO_?INCREMENT/gi, replacement: 'PRIMARY KEY AUTOINCREMENT' },
+];
+
 const mysqlToSQLiteParser = (mysqlQuery) => {
     let sqliteQuery = mysqlQuery;
 
-    // Step 1: Direct replacements for MySQL-specific syntax
-    const replacements = [
-        { regex: /AUTO_INCREMENT/g, replacement: "AUTOINCREMENT" },
-        { regex: /ENGINE=\w+/g, replacement: "" },
-        { regex: /DEFAULT CHARSET=\w+/g, replacement: "" },
-        { regex: /`([^`]+)`/g, replacement: '"$1"' }, // Backticks to double quotes
-        { regex: /CURRENT_TIMESTAMP\(\)/g, replacement: "CURRENT_TIMESTAMP" },
-        { regex: /NOW\(\)/g, replacement: "CURRENT_TIMESTAMP" }, // For NOW()
-        { regex: /CURDATE\(\)/g, replacement: "DATE('now')" }, // CURDATE()
-        { regex: /CURTIME\(\)/g, replacement: "TIME('now')" }, // CURTIME()
-        { regex: /UUID\(\)/g, replacement: "LOWER(HEX(RANDOMBLOB(16)))" }, // UUID()
-    ];
-
-    // Step 2: Type conversions for MySQL data types
-    const typeMappings = [{
-            regex: /\b(INT|TINYINT|SMALLINT|MEDIUMINT|BIGINT)\(\d+\)/g,
-            replacement: "INTEGER",
-        },
-        { regex: /\b(DOUBLE|FLOAT|DECIMAL\(\d+,\d+\))\b/g, replacement: "REAL" },
-        { regex: /\b(VARCHAR|CHAR)\(\d+\)/g, replacement: "TEXT" },
-        { regex: /\bTINYINT\b/g, replacement: "INTEGER" }, // MySQL TINYINT to INTEGER
-        { regex: /\bBLOB\b/g, replacement: "BLOB" }, // MySQL BLOB stays the same
-        { regex: /\bTEXT\b/g, replacement: "TEXT" }, // TEXT without length
-    ];
-
-    // Step 3: Special handling for SQL functions and expressions
-    const functionMappings = [{
-            regex: /DATE_ADD\(([^,]+), INTERVAL ([^,]+) (\w+)\)/g,
-            replacement: "DATETIME($1, '+$2 $3')",
-        }, // DATE_ADD
-        {
-            regex: /DATE_SUB\(([^,]+), INTERVAL ([^,]+) (\w+)\)/g,
-            replacement: "DATETIME($1, '-$2 $3')",
-        }, // DATE_SUB
-        {
-            regex: /DATEDIFF\(([^,]+), ([^)]+)\)/g,
-            replacement: "(JULIANDAY($1) - JULIANDAY($2))",
-        },
-        // DATEDIFF
-        { regex: /DATE\(([^)]+)\)/g, replacement: "DATE($1)" }, // DATE()
-        { regex: /TIMESTAMP\(([^)]+)\)/g, replacement: "DATETIME($1)" }, // TIMESTAMP
-        { regex: /YEAR\(([^)]+)\)/g, replacement: "strftime('%Y', $1)" }, // YEAR()
-        { regex: /MONTH\(([^)]+)\)/g, replacement: "strftime('%m', $1)" }, // MONTH()
-        { regex: /DAY\(([^)]+)\)/g, replacement: "strftime('%d', $1)" }, // DAY()
-        { regex: /HOUR\(([^)]+)\)/g, replacement: "strftime('%H', $1)" }, // HOUR()
-        { regex: /MINUTE\(([^)]+)\)/g, replacement: "strftime('%M', $1)" }, // MINUTE()
-        { regex: /SECOND\(([^)]+)\)/g, replacement: "strftime('%S', $1)" }, // SECOND()
-        {
-            regex: /LAST_DAY\(([^)]+)\)/g,
-            replacement: "DATE($1, 'start of month', '+1 month', '-1 day')",
-        }, // LAST_DAY
-        {
-            regex: /WEEK\(([^,]+)(?:, (\d))?\)/g,
-            replacement: "strftime('%W', $1)", // Simplified; assumes no mode handling
-        }, // WEEK
-        {
-            regex: /QUARTER\(([^)]+)\)/g,
-            replacement: "(CAST(strftime('%m', $1) AS INTEGER) + 2) / 3",
-        }, // QUARTER
-        {
-            regex: /DAYOFWEEK\(([^)]+)\)/g,
-            replacement: "strftime('%w', $1) + 1",
-        }, // DAYOFWEEK (Sunday = 1)
-        {
-            regex: /DAYOFYEAR\(([^)]+)\)/g,
-            replacement: "strftime('%j', $1)",
-        }, // DAYOFYEAR
-        {
-            regex: /TIME_TO_SEC\(([^)]+)\)/g,
-            replacement: "(strftime('%H', $1) * 3600 + strftime('%M', $1) * 60 + strftime('%S', $1))",
-        }, // TIME_TO_SEC
-        {
-            regex: /SEC_TO_TIME\((\d+)\)/g,
-            replacement: "strftime('%H:%M:%S', $1, 'unixepoch')",
-        }, // SEC_TO_TIME
-    ];
-
-    // Step 4: Special case for LIMIT OFFSET syntax
-    const specialCases = [
-        { regex: /LIMIT (\d+), (\d+)/g, replacement: "LIMIT $2 OFFSET $1" },
-        { regex: /LIMIT (\d+)/g, replacement: "LIMIT $1" }, // Handle cases without OFFSET
-    ];
-
-    // Step 5: Handle MySQL's JOIN conditions (if needed)
-    const joinMappings = [
-        // Only replace JOIN not preceded by LEFT/RIGHT/FULL/OUTER
-        { regex: /(?<!LEFT |RIGHT |FULL |OUTER )\bJOIN\b/g, replacement: "INNER JOIN" },
-        { regex: /\bLEFT JOIN\b/g, replacement: "LEFT OUTER JOIN" },
-        { regex: /\bRIGHT JOIN\b/g, replacement: "RIGHT OUTER JOIN" },
-        { regex: /\bFULL JOIN\b/g, replacement: "FULL OUTER JOIN" },
-    ];
-
-    // Apply all direct replacements
-    replacements.forEach(({ regex, replacement }) => {
-        sqliteQuery = sqliteQuery.replace(regex, replacement);
-    });
-
-    // Apply type mappings
-    typeMappings.forEach(({ regex, replacement }) => {
-        sqliteQuery = sqliteQuery.replace(regex, replacement);
-    });
-
-    // Apply function mappings
+    // Apply all function mappings
     functionMappings.forEach(({ regex, replacement }) => {
         sqliteQuery = sqliteQuery.replace(regex, replacement);
     });
 
-    // Apply special cases for LIMIT OFFSET
-    specialCases.forEach(({ regex, replacement }) => {
-        sqliteQuery = sqliteQuery.replace(regex, replacement);
-    });
+    // Post-processing fixes
+    sqliteQuery = sqliteQuery
+        // Remove MySQL-specific syntax
+        .replace(/ENGINE=\w+|DEFAULT CHARSET=\w+|COLLATE=\w+/g, '')
+        // Clean up whitespace
+        .replace(/[ \t]+/g, ' ')
+        .replace(/\n\s*\n/g, '\n')
+        .trim();
 
-    // Apply JOIN mapping
-    joinMappings.forEach(({ regex, replacement }) => {
-        sqliteQuery = sqliteQuery.replace(regex, replacement);
-    });
+    // Format based on query type
+    if (sqliteQuery.toLowerCase().startsWith('create table')) {
+        sqliteQuery = formatCreateTable(sqliteQuery);
+    } else if (sqliteQuery.toLowerCase().includes('group_concat')) {
+        sqliteQuery = handleGroupConcat(sqliteQuery);
+    } else {
+        sqliteQuery = formatSQL(sqliteQuery);
+    }
 
-    // Return the final SQLite query
+    // Warning for unsupported features
+    if (sqliteQuery.includes("WITH ROLLUP")) {
+        console.warn("GROUP BY WITH ROLLUP is not supported in SQLite");
+        sqliteQuery = sqliteQuery.replace(/WITH ROLLUP/g, "/* WITH ROLLUP not supported */");
+    }
+
     return sqliteQuery;
 };
 
 module.exports = mysqlToSQLiteParser;
-
